@@ -6,13 +6,9 @@ from keras.optimizers import Nadam
 from keras.callbacks import ModelCheckpoint, EarlyStopping
 from keras.callbacks import ReduceLROnPlateau
 from keras.callbacks import CSVLogger, LearningRateScheduler
+from keras.applications.resnet_v2 import ResNet50V2
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from keras.applications.xception import Xception
-from keras.applications.inception_v3 import InceptionV3
-from keras.applications.inception_resnet_v2 import InceptionResNetV2
-from keras.applications.resnet import ResNet50
-from keras.applications.nasnet import NASNetLarge
+from sklearn.preprocessing import LabelEncoder, LabelBinarizer
 from matplotlib import pyplot as plt
 from keras import backend as K
 from keras import utils
@@ -23,8 +19,8 @@ from os.path import exists
 from os import makedirs
 import efficientnet.keras as efn
 # from clr_callback import CyclicLR
-from keras_efficientnets import EfficientNetB5, EfficientNetB0
-# from random_eraser import get_random_eraser  # added
+from random_eraser import get_random_eraser  # added
+from mixup_generator import MixupGenerator
 
 
 # MIN_LR = 1e-7
@@ -33,59 +29,30 @@ from keras_efficientnets import EfficientNetB5, EfficientNetB0
 # CLR_METHOD = "triangular"
 
 
-def cnn_model(model_name, img_size, nb_classes, model_no=7):
+def cnn_model(model_name, img_size, nb_classes):
     """
     Model definition using Xception net architecture
     """
     input_size = (img_size, img_size, 3)
 
-    if model_name == "xception":
-        print("Loading Xception wts...")
-        baseModel = Xception(
-            weights="imagenet", include_top=False, input_shape=(img_size, img_size, 3)
-        )
-    elif model_name == "iv3":
-        baseModel = InceptionV3(
-            weights="imagenet", include_top=False, input_shape=(img_size, img_size, 3)
-        )
-    elif model_name == "irv2":
-        baseModel = InceptionResNetV2(
-            weights="imagenet", include_top=False, input_shape=(img_size, img_size, 3)
-        )
-    elif model_name == "resnet":
-        baseModel = ResNet50(
-            weights="imagenet", include_top=False, input_shape=(img_size, img_size, 3)
-        )
-    elif model_name == "nasnet":
-        baseModel = NASNetLarge(
-            weights="imagenet", include_top=False, input_shape=(img_size, img_size, 3)
-        )
-    # elif model_name == "ef0":
-    #     baseModel = EfficientNetB0(
-    #         input_size, weights="imagenet", include_top=False 
-    #     )
-    # elif model_name == "ef5":
-    #     baseModel = EfficientNetB5(
-    #         input_size, weights="imagenet", include_top=False 
-    #     )
-    elif model_name == "efn":
+    if model_name == "efn":
         baseModel = efn.EfficientNetB7(weights="imagenet", include_top=False,
             input_shape=input_size)
+    elif model_name == "res50v2":
+        baseModel = ResNet50V2(
+            weights="imagenet", include_top=False, input_shape=(img_size, img_size, 3)
+        )
     elif model_name == "efn_noisy":
-        baseModel = efn.EfficientNetB7(weights="noisy-student", include_top=False,
+        baseModel = efn.EfficientNetB5(weights="noisy-student", include_top=False,
             input_shape=input_size)
 
     
     headModel = baseModel.output
     headModel = GlobalAveragePooling2D()(headModel)
-    headModel = Dense(512, activation="relu", kernel_initializer="he_uniform")(
+    headModel = Dense(1024, activation="relu", kernel_initializer="he_uniform")(
         headModel
     )
     headModel = Dropout(0.4)(headModel)
-    # headModel = Dense(512, activation="relu", kernel_initializer="he_uniform")(
-    #     headModel
-    # )
-    # headModel = Dropout(0.5)(headModel)
     predictions = Dense(
         nb_classes,
         activation="softmax",
@@ -109,63 +76,14 @@ def cnn_model(model_name, img_size, nb_classes, model_no=7):
     return model
 
 
-def focal_loss(gamma=2., alpha=.25):
-    def focal_loss_fixed(y_true, y_pred):
-        pt_1 = tf.where(tf.equal(y_true, 1), y_pred, tf.ones_like(y_pred))
-        pt_0 = tf.where(tf.equal(y_true, 0), y_pred, tf.zeros_like(y_pred))
-        return -K.mean(alpha * K.pow(1. - pt_1, gamma) * K.log(pt_1)) - K.mean((1 - alpha) * K.pow(pt_0, gamma) * K.log(1. - pt_0))
-    return focal_loss_fixed
+def smooth_labels(labels, factor=0.1):
+    # smooth the labels
+    labels *= (1 - factor)
+    labels += (factor / labels.shape[1])
+    # returned the smoothed labels
+    return labels
 
 
-def binary_focal_loss(gamma=2., alpha=.25):
-    """
-    Binary form of focal loss.
-      FL(p_t) = -alpha * (1 - p_t)**gamma * log(p_t)
-      where p = sigmoid(x), p_t = p or 1 - p depending on if the label is 1 or 0, respectively.
-    References:
-        https://arxiv.org/pdf/1708.02002.pdf
-    Usage:
-     model.compile(loss=[binary_focal_loss(alpha=.25, gamma=2)], metrics=["accuracy"], optimizer=adam)
-    """
-    def binary_focal_loss_fixed(y_true, y_pred):
-        """
-        :param y_true: A tensor of the same shape as `y_pred`
-        :param y_pred:  A tensor resulting from a sigmoid
-        :return: Output tensor.
-        """
-        pt_1 = tf.where(tf.equal(y_true, 1), y_pred, tf.ones_like(y_pred))
-        pt_0 = tf.where(tf.equal(y_true, 0), y_pred, tf.zeros_like(y_pred))
-
-        epsilon = K.epsilon()
-        # clip to prevent NaN's and Inf's
-        pt_1 = K.clip(pt_1, epsilon, 1. - epsilon)
-        pt_0 = K.clip(pt_0, epsilon, 1. - epsilon)
-
-        return -K.mean(alpha * K.pow(1. - pt_1, gamma) * K.log(pt_1)) \
-               -K.mean((1 - alpha) * K.pow(pt_0, gamma) * K.log(1. - pt_0))
-
-    return binary_focal_loss_fixed
-
-    
-# def categorical_focal_loss(gamma=2., alpha=.25):
-#     """
-#     Softmax version of focal loss.
-#            m
-#       FL = ∑  -alpha * (1 - p_o,c)^gamma * y_o,c * log(p_o,c)
-#           c=1
-#       where m = number of classes, c = class and o = observation
-#     Parameters:
-#       alpha -- the same as weighing factor in balanced cross entropy
-#       gamma -- focusing parameter for modulating factor (1-p)
-#     Default value:
-#       gamma -- 2.0 as mentioned in the paper
-#       alpha -- 0.25 as mentioned in the paper
-#     References:
-#         Official paper: https://arxiv.org/pdf/1708.02002.pdf
-#         https://www.tensorflow.org/api_docs/python/tf/keras/backend/categorical_crossentropy
-#     Usage:
-#      model.compile(loss=[categorical_focal_loss(alpha=.25, gamma=2)], metrics=["accuracy"], optimizer=adam)
-#     """
 def categorical_focal_loss_fixed(y_true, y_pred, gamma, alpha):
     """
     :param y_true: A tensor of the same shape as `y_pred`
@@ -203,19 +121,21 @@ def joint_loss(y_true, y_pred):
     return foc_loss + cat_loss
 
 
-def build_lrfn(lr_start=0.00001, lr_max=0.000075, 
-               lr_min=0.000001, lr_rampup_epochs=20, 
-               lr_sustain_epochs=0, lr_exp_decay=.8):
-    lr_max = lr_max * strategy.num_replicas_in_sync
+LR_START = 0.0001
+LR_MAX = 0.00005
+LR_MIN = 0.0001
+LR_RAMPUP_EPOCHS = 4
+LR_SUSTAIN_EPOCHS = 6
+LR_EXP_DECAY = .8
 
-    def lrfn(epoch):
-        if epoch < lr_rampup_epochs:
-            lr = (lr_max - lr_start) / lr_rampup_epochs * epoch + lr_start
-        elif epoch < lr_rampup_epochs + lr_sustain_epochs:
-            lr = lr_max
-        else:
-            lr = (lr_max - lr_min) * lr_exp_decay**(epoch - lr_rampup_epochs - lr_sustain_epochs) + lr_min
-        return lr
+def lrfn(epoch):
+    if epoch < LR_RAMPUP_EPOCHS:
+        lr = (LR_MAX - LR_START) / LR_RAMPUP_EPOCHS * epoch + LR_START
+    elif epoch < LR_RAMPUP_EPOCHS + LR_SUSTAIN_EPOCHS:
+        lr = LR_MAX
+    else:
+        lr = (LR_MAX - LR_MIN) * LR_EXP_DECAY**(epoch - LR_RAMPUP_EPOCHS - LR_SUSTAIN_EPOCHS) + LR_MIN
+    return lr
 
 
 def main():
@@ -224,19 +144,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "-e", "--epochs", type=int,
-        help="Number of epochs", default=25
+        help="Number of epochs", default=50
     )
     ap.add_argument(
-        "-m", "--model_name", required=True, type=str,
-        help="Imagenet model to train", default="xception"
+        "-m", "--model_name", type=str,
+        help="Imagenet model to train", default="efn_noisy"
     )
     ap.add_argument(
-        "-b", "--batch_size", required=True, type=int,
+        "-b", "--batch_size", type=int,
         help="Batch size", default=8
     )
     ap.add_argument(
         "-im_size", "--image_size", type=int,
-        help="Batch size", default=224
+        help="Batch size", default=299
     )
     ap.add_argument(
         "-n_class", "--n_classes", type=int,
@@ -252,16 +172,12 @@ def main():
     args = ap.parse_args()
 
     # Training dataset loading
-    train_data = np.load("../train_data.npy")
-    train_label = np.load("../train_label.npy")
-    # print(train_label[:60])
-    encoder = LabelEncoder()
-    encoder.fit(train_label)
-    encoded_y = encoder.transform(train_label)
-    # print(encoded_y[:60])
-    # ls = set(encoded_y)
-    # print(ls)
-    Y = utils.to_categorical(encoded_y)
+    train_data = np.load("../train_data_299.npy")
+    train_label = np.load("../train_label_299.npy")
+    lb = LabelBinarizer()
+    Y = lb.fit_transform(train_label)
+    Y = Y.astype("float")
+    Y = smooth_labels(Y)
 
     print("Dataset Loaded...")
 
@@ -274,22 +190,10 @@ def main():
     trainX /= 255
     valX /= 255
     trainX_mean = np.mean(trainX, axis=0)
+    np.save("train_data_mean_299.npy", trainX_mean)
+    print("Training data mean file saved...")
     trainX -= trainX_mean
     valX -= trainX_mean
-
-    # Train nad validation image data generator
-    # trainAug = ImageDataGenerator(
-    #     rescale=1.0 / 255.0,
-    #     # preprocessing_function=get_random_eraser(p=0.5, s_l=0.02, s_h=0.4, r_1=0.3, r_2=1/0.3,
-    #     #           v_l=0, v_h=255, pixel_level=False),
-    #     rotation_range=30,
-    #     zoom_range=0.15,
-    #     width_shift_range=0.2,
-    #     height_shift_range=0.2,
-    #     shear_range=0.15,
-    #     horizontal_flip=True,
-    #     fill_mode="nearest",
-    # )
 
     datagen = ImageDataGenerator(
         # set input mean to 0 over the dataset
@@ -307,13 +211,13 @@ def main():
         # randomly rotate images in the range (deg 0 to 180)
         rotation_range=30,
         # randomly shift images horizontally
-        width_shift_range=0.1,
+        width_shift_range=0.2,
         # randomly shift images vertically
-        height_shift_range=0.1,
+        height_shift_range=0.2,
         # set range for random shear
-        shear_range=0.,
+        shear_range=0.1,
         # set range for random zoom
-        zoom_range=0.15,
+        zoom_range=0.1,
         # set range for random channel shifts
         channel_shift_range=0.,
         # set mode for filling points outside the input boundaries
@@ -327,7 +231,8 @@ def main():
         # set rescaling factor (applied before any other transformation)
         rescale=None,
         # set function that will be applied on each input
-        preprocessing_function=None,
+        preprocessing_function=get_random_eraser(p=0.5, s_l=0.02, s_h=0.4, r_1=0.3, r_2=1/0.3,
+                  v_l=np.min(trainX), v_h=np.max(trainX), pixel_level=False),
         # image data format, either "channels_first" or "channels_last"
         data_format=None,
         # fraction of images reserved for validation (strictly between 0 and 1)
@@ -349,8 +254,6 @@ def main():
 
     if not exists("./trained_wts"):
         makedirs("./trained_wts")
-    # if not exists("./training_logs"):
-    #     makedirs("./training_logs")
     if not exists("./plots"):
         makedirs("./plots")
 
@@ -369,7 +272,6 @@ def main():
                                    cooldown=0,
                                    patience=3,
                                    min_lr=0.5e-6)
-    lrfn = build_lrfn()
     lr_schedule = LearningRateScheduler(lrfn, verbose=1)
 
     # clr = CyclicLR(
@@ -380,16 +282,18 @@ def main():
     # )
     print("Training is going to start in 3... 2... 1... ")
 
-    datagen.fit(trainX)
+    # datagen.fit(trainX)
+    training_generator = MixupGenerator(trainX, trainY, batch_size=8, alpha=0.2, datagen=datagen)()
     # Model Training
     H = model.fit_generator(
-        datagen.flow(trainX, trainY, batch_size=args.batch_size),
+        # datagen.flow(trainX, trainY, batch_size=args.batch_size),
+        training_generator,
         steps_per_epoch=len(trainX) // args.batch_size,
         validation_data=(valX, valY),
         validation_steps=len(valX) // args.batch_size,
         epochs=args.epochs,
-        workers=4,
-        callbacks=[model_checkpoint, lr_reducer],
+        # workers=4,
+        callbacks=[model_checkpoint, lr_reducer, lr_schedule],
     )
 
     # plot the training loss and accuracy
@@ -404,15 +308,8 @@ def main():
     plt.xlabel("Epoch #")
     plt.ylabel("Loss/Accuracy")
     plt.legend(loc="lower left")
-    plt.savefig("plots/training_plot.png")
+    plt.savefig("plots/training_plot_4.png")
 
-    # N = np.arange(0, len(clr.history["lr"]))
-    # plt.figure()
-    # plt.plot(N, clr.history["lr"])
-    # plt.title("Cyclical Learning Rate (CLR)")
-    # plt.xlabel("Training Iterations")
-    # plt.ylabel("Learning Rate")
-    # plt.savefig("plots/cyclic_lr.png")
 
     end = time.time()
     dur = end - start
